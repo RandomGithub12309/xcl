@@ -462,6 +462,7 @@ pub fn note_gpu_write(res: usize) {
         if !e.gpu_written {
             e.gpu_written = true;
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+            TEXTURES_GEN.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -614,6 +615,14 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+fn watched_texture_ranges(t: &Table) -> Vec<(usize, usize)> {
+    t.by_res
+        .values()
+        .filter(|e| !e.gpu_written)
+        .map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF))
+        .collect()
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let key = (
         super::sparse::mapped_gen(),
@@ -632,7 +641,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted = watched_texture_ranges(&TEXTURES.lock().unwrap());
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -1820,5 +1829,53 @@ mod tests {
             }
             uma.free(base);
         }
+    }
+
+    #[test]
+    fn note_gpu_write_bumps_generation_and_excludes_texture_from_watch_ranges() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let (res_cpu, res_gpu) = (0x7A00_0001usize, 0x7A00_0002usize);
+        let (src_cpu, src_gpu) = (0x7B00_0000usize, 0x7C00_0000usize);
+        let make_entry = |src: usize| Entry {
+            device: 0,
+            va: src,
+            src,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res_cpu, make_entry(src_cpu));
+            t.insert(res_gpu, make_entry(src_gpu));
+            let before = watched_texture_ranges(&t);
+            assert!(before.iter().any(|&(a, b)| a <= src_cpu && b >= src_cpu + 0x4000));
+            assert!(before.iter().any(|&(a, b)| a <= src_gpu && b >= src_gpu + 0x4000));
+        }
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
+
+        let gen_before = TEXTURES_GEN.load(Ordering::Acquire);
+        note_gpu_write(res_gpu);
+        let gen_after = TEXTURES_GEN.load(Ordering::Acquire);
+        assert!(gen_after > gen_before, "note_gpu_write must invalidate cached_watch_ranges");
+        // Calling again on an already gpu_written texture is idempotent.
+        note_gpu_write(res_gpu);
+        assert_eq!(TEXTURES_GEN.load(Ordering::Acquire), gen_after);
+
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            let after = watched_texture_ranges(&t);
+            assert!(after.iter().any(|&(a, b)| a <= src_cpu && b >= src_cpu + 0x4000));
+            assert!(!after.iter().any(|&(a, _)| a == src_gpu));
+            t.remove(res_cpu);
+            t.remove(res_gpu);
+        }
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
