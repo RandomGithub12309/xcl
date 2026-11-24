@@ -251,6 +251,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
+            if t & 0x1000 == 0 {
+                mirrors::reserved(q, size, t, p);
+            }
             trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -430,6 +433,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         if release {
             u.sparse_release(a);
+            mirrors::released(a);
         }
         return 1;
     }
@@ -2538,5 +2542,21 @@ mod tests {
         let stub_h = modules::hle_handle("unit_stub_probe.dll");
         assert_ne!(stub_h, 0);
         assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), stub_h);
+    }
+
+    #[test]
+    fn virtual_alloc_64k_pairs_track_mirrors_across_sparse_and_fallback() {
+        unsafe {
+            let size = 0x37_0000usize;
+            let cpu = VirtualAlloc(std::ptr::null(), size, 0x2040_2000, mem::PAGE_READWRITE);
+            assert!(!cpu.is_null());
+            let gpu = VirtualAlloc(std::ptr::null(), size, 0x2040_2000, 0x801);
+            assert!(!gpu.is_null());
+            assert_eq!(mirrors::source(gpu as usize), Some(cpu as usize));
+            assert_eq!(mirrors::source(gpu as usize + 0x12345), Some(cpu as usize + 0x12345));
+            assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(mirrors::source(gpu as usize), None);
+            assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
+        }
     }
 }
