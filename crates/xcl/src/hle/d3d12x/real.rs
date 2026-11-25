@@ -464,6 +464,11 @@ pub fn init() -> Result<String, String> {
     if !device_raw().is_null() {
         return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
     }
+    static INIT: Mutex<()> = Mutex::new(());
+    let _init = INIT.lock().unwrap();
+    if !device_raw().is_null() {
+        return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
+    }
     unsafe {
         let cfg = crate::state::config();
         match crate::gpu::agility::state() {
@@ -6311,6 +6316,34 @@ mod map_tests {
                 m.remove(&(raw as usize));
                 m.remove(&(upload.as_raw() as usize));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_init_returns_consistent_adapter() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let b = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    init()
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        if results.iter().any(|r| r.is_err()) {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let first = results[0].as_ref().unwrap();
+        for res in &results {
+            assert_eq!(res.as_ref().unwrap(), first);
         }
     }
 }
